@@ -9,6 +9,8 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # A documentation-only commit must not rebuild and republish the toolchain.
+    paths-ignore: ['README.md', 'LICENSE']
 
 concurrency:
   group: lab-${{ github.ref }}
@@ -492,24 +494,25 @@ jobs:
           short=${LLVM_RELEASE_REF:0:12}
           tag="toolchain-${short}"
           (cd dist && sha256sum -c ./*.sha256)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::the release $tag exists already; its asset is immutable and is left unchanged"
+            gh release view "$tag" --json tagName,assets --jq '.tagName, (.assets[] | .name + " " + (.size|tostring) + " " + .url)'
+            exit 0
+          fi
           {
             echo "Trimmed LLVM ${LLVM_BASE_RELEASE} toolchain for macOS arm64 whose ld64.lld is built from llvm-project \`${LLVM_RELEASE_REF}\` (${LLVM_RELEASE_BRANCH})."
             echo
             echo "Validation result of the workflow run that published it: check-x1 ${RESULT_X1}, check-x1-negative ${RESULT_NEGATIVE}, check-macos15 ${RESULT_MACOS15}."
             echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo
-            echo "sha256:"
-            echo
             echo '```'
+            grep -E '^(name|official package|lld source|lld version|stock lld version|clang version):' dist/MANIFEST.txt
+            echo "size: $(stat -c %s dist/*.tar.xz) bytes"
             cat dist/*.sha256
             echo '```'
             echo
-            echo "The MANIFEST.txt asset states which component comes from where."
+            echo "MANIFEST.txt states which component comes from where."
           } > release-notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
-              --title "Toolchain ${LLVM_BASE_RELEASE} with lld ${short}" --notes-file release-notes.md
-          fi
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+            --title "Toolchain ${LLVM_BASE_RELEASE} with lld ${short}" --notes-file release-notes.md
           gh release view "$tag" --json tagName,assets --jq '.tagName, (.assets[] | .name + " " + (.size|tostring) + " " + .url)'
