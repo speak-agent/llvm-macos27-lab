@@ -1,0 +1,498 @@
+name: lab
+
+# Validates that an ld64.lld built from the LLVM release/23.x branch links against
+# the Xcode 27 macOS SDK, and publishes the trimmed toolchain used for the check.
+# Pinned inputs: refs.env. At most three macOS jobs run at the same time.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-lld:
+    runs-on: macos-15
+    timeout-minutes: 300
+    outputs:
+      short: ${{ steps.refs.outputs.short }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the pinned inputs
+        id: refs
+        run: |
+          set -euo pipefail
+          grep -E '^[A-Z_]+=' refs.env >> "$GITHUB_ENV"
+          . ./refs.env
+          echo "short=${LLVM_RELEASE_REF:0:12}" >> "$GITHUB_OUTPUT"
+          echo "LLD_SHORT=${LLVM_RELEASE_REF:0:12}" >> "$GITHUB_ENV"
+
+      - name: Check that the pinned commit contains the arm64e.x1 support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status=$(gh api "repos/llvm/llvm-project/compare/${LLVM_FIX_COMMIT}...${LLVM_RELEASE_REF}" --jq .status)
+          echo "compare ${LLVM_FIX_COMMIT:0:12}...${LLVM_RELEASE_REF:0:12}: $status"
+          case "$status" in
+            ahead|identical) ;;
+            *) echo "::error::LLVM_RELEASE_REF does not contain LLVM_FIX_COMMIT"; exit 1 ;;
+          esac
+
+      - name: Install ninja and ccache
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          brew install ninja ccache
+          ninja --version
+          ccache --version | head -n 1
+          cmake --version | head -n 1
+          xcodebuild -version
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-lld-${{ env.LLVM_RELEASE_REF }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-lld-${{ env.LLVM_RELEASE_REF }}-
+            ccache-lld-
+
+      - name: Fetch llvm-project (shallow, sparse)
+        run: scripts/fetch-llvm.sh "$LLVM_RELEASE_REF" "$GITHUB_WORKSPACE/llvm-project"
+
+      - name: Verify the fix is in the sources
+        run: |
+          set -euo pipefail
+          grep -n 'arm64e_x1' llvm-project/llvm/include/llvm/TextAPI/Architecture.def
+
+      - name: Build lld and llvm-objdump
+        run: scripts/build-lld.sh "$GITHUB_WORKSPACE/llvm-project" "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/out"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-lld-${{ env.LLVM_RELEASE_REF }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### build-lld"
+            echo
+            echo "lld commit: \`${LLVM_RELEASE_REF}\` (${LLVM_RELEASE_BRANCH})"
+            echo
+            echo '```'
+            cat out/build-info.env 2>/dev/null || echo "no build info"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lld-${{ env.LLD_SHORT }}
+          path: |
+            out/lld-macos-arm64.tar
+            out/build-info.env
+          compression-level: 0
+          if-no-files-found: error
+
+  compose:
+    needs: build-lld
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the pinned inputs
+        run: |
+          set -euo pipefail
+          grep -E '^[A-Z_]+=' refs.env >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: lld-${{ needs.build-lld.outputs.short }}
+          path: lld-dl
+
+      - name: Unpack the lld under test
+        run: |
+          set -euo pipefail
+          mkdir lld-dir
+          tar -xf lld-dl/lld-macos-arm64.tar -C lld-dir
+          ls -l lld-dir/bin
+          cat lld-dl/build-info.env
+
+      - name: Download the official package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="LLVM-${LLVM_BASE_RELEASE}-macOS-ARM64.tar.xz"
+          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_BASE_RELEASE}/${asset}"
+          curl -fL --retry 5 --retry-delay 10 -o "$RUNNER_TEMP/$asset" "$url"
+          ls -l "$RUNNER_TEMP/$asset"
+          sha=$(shasum -a 256 "$RUNNER_TEMP/$asset" | cut -d' ' -f1)
+          digest=$(gh api "repos/llvm/llvm-project/releases/tags/llvmorg-${LLVM_BASE_RELEASE}" \
+            --jq ".assets[] | select(.name==\"$asset\") | .digest")
+          echo "sha256 $sha"
+          echo "github digest $digest"
+          if [ -n "$digest" ] && [ "$digest" != "sha256:$sha" ]; then
+            echo "::error::the download does not match the digest published by GitHub"
+            exit 1
+          fi
+          echo "PKG_PATH=$RUNNER_TEMP/$asset" >> "$GITHUB_ENV"
+          echo "PKG_SHA256=$sha" >> "$GITHUB_ENV"
+
+      - name: Compose the toolchain
+        env:
+          BASE_VER: ${{ env.LLVM_BASE_RELEASE }}
+          LLD_COMMIT: ${{ env.LLVM_RELEASE_REF }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/compose.sh "$PKG_PATH" "$GITHUB_WORKSPACE/lld-dir" "$GITHUB_WORKSPACE/compose-out"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### compose"
+            echo
+            echo '```'
+            cat compose-out/listing/package-facts.env 2>/dev/null || echo "no facts"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain
+          path: compose-out/dist
+          compression-level: 0
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stock-lld
+          path: compose-out/stock
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: official-package-listing
+          path: compose-out/listing
+          if-no-files-found: warn
+
+  check-x1:
+    needs: compose
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assert the macOS major version is 27
+        run: |
+          major=$(sw_vers -productVersion | cut -d. -f1)
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset} macOS=$(sw_vers -productVersion)"
+          if [ "$major" != 27 ]; then
+            echo "::error::expected macOS 27 but the runner reports $(sw_vers -productVersion)"
+            exit 1
+          fi
+
+      - name: Runner image and SDK report
+        run: scripts/env-report.sh "$RUNNER_TEMP/env-report.env"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain
+          path: dl
+
+      - name: Unpack the toolchain
+        run: |
+          set -euo pipefail
+          cd dl
+          shasum -a 256 -c ./*.sha256
+          mkdir -p "$RUNNER_TEMP/tc"
+          tar -xf ./*.tar.xz -C "$RUNNER_TEMP/tc"
+          ls "$RUNNER_TEMP/tc"
+          echo "TC=$(echo "$RUNNER_TEMP"/tc/*)" >> "$GITHUB_ENV"
+
+      - name: Compile, link and run with the lld under test
+        run: scripts/check-link.sh "$TC" "$RUNNER_TEMP/check"
+
+      - name: Assert
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/check/results.env"
+          echo "CXX_LINK=$CXX_LINK CXX_RUN=$CXX_RUN C_LINK=$C_LINK C_RUN=$C_RUN IMPORT_STD=$IMPORT_STD SYNTH_LINK=$SYNTH_LINK"
+          ok=1
+          for v in CXX_LINK CXX_RUN C_LINK C_RUN SYNTH_LINK; do
+            [ "${!v}" = pass ] || { echo "::error::$v is ${!v}, expected pass"; ok=0; }
+          done
+          case "$IMPORT_STD" in pass|not-applicable) ;; *) echo "::error::IMPORT_STD is $IMPORT_STD"; ok=0 ;; esac
+          [ "$ok" = 1 ]
+
+      - name: Summary
+        if: always()
+        run: |
+          . refs.env
+          . "$RUNNER_TEMP/env-report.env" 2>/dev/null || true
+          {
+            echo "### check-x1 (lld under test)"
+            echo
+            echo "| Run | Job | ImageVersion | Xcode | arm64e.x1 in libSystem.tbd | lld commit |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            echo "| ${{ github.run_id }} | check-x1 | ${IMAGE_VERSION:-} | ${XCODE_VERSION:-} | ${X1_IN_LIBSYSTEM_TBD:-} | ${LLVM_RELEASE_REF:0:12} |"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/check/results.env" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-check-x1
+          path: |
+            ${{ runner.temp }}/check/*.log
+            ${{ runner.temp }}/check/results.env
+            ${{ runner.temp }}/env-report.env
+          if-no-files-found: warn
+
+  check-x1-negative:
+    needs: compose
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assert the macOS major version is 27
+        run: |
+          major=$(sw_vers -productVersion | cut -d. -f1)
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset} macOS=$(sw_vers -productVersion)"
+          if [ "$major" != 27 ]; then
+            echo "::error::expected macOS 27 but the runner reports $(sw_vers -productVersion)"
+            exit 1
+          fi
+
+      - name: Runner image and SDK report
+        run: scripts/env-report.sh "$RUNNER_TEMP/env-report.env"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain
+          path: dl
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: stock-lld
+          path: stock-dl
+
+      - name: Unpack the toolchain and put the stock lld in place of the lld under test
+        run: |
+          set -euo pipefail
+          (cd dl && shasum -a 256 -c ./*.sha256)
+          mkdir -p "$RUNNER_TEMP/tc-stock" "$RUNNER_TEMP/stock"
+          tar -xf dl/*.tar.xz -C "$RUNNER_TEMP/tc-stock"
+          tar -xf stock-dl/stock-lld.tar -C "$RUNNER_TEMP/stock"
+          tc=$(echo "$RUNNER_TEMP"/tc-stock/*)
+          rm -f "$tc/bin/lld" "$tc/bin/ld64.lld"
+          cp -p "$RUNNER_TEMP/stock/bin/lld" "$tc/bin/lld"
+          ln -s lld "$tc/bin/ld64.lld"
+          "$tc/bin/ld64.lld" --version | head -n 1
+          echo "TC=$tc" >> "$GITHUB_ENV"
+
+      - name: Compile, link and run with the stock 23.1.2 lld
+        run: scripts/check-link.sh "$TC" "$RUNNER_TEMP/check"
+
+      - name: Assert that the stock lld fails on the SDK
+        run: |
+          set -eu
+          . "$RUNNER_TEMP/check/results.env"
+          echo "CXX_LINK=$CXX_LINK C_LINK=$C_LINK SYNTH_LINK=$SYNTH_LINK"
+          if [ "$CXX_LINK" = pass ]; then
+            echo "::error::the stock lld linked the C++ program: the image no longer exercises the defect, so the positive result is not discriminating"
+            exit 1
+          fi
+          grep -q 'unknown architecture' "$RUNNER_TEMP/check/cxx-link.log" \
+            || { echo "::error::the failure does not contain 'unknown architecture'"; exit 1; }
+          grep -q 'arm64e.x1' "$RUNNER_TEMP/check/cxx-link.log" \
+            || { echo "::error::the failure does not contain 'arm64e.x1'"; exit 1; }
+          [ "$SYNTH_LINK" = fail ] \
+            || { echo "::error::the stock lld linked the synthetic arm64e.x1 stub"; exit 1; }
+          echo "the stock lld fails as expected:"
+          grep -m 3 -E 'unknown architecture|could not load TAPI' "$RUNNER_TEMP/check/cxx-link.log" | cut -c1-300
+
+      - name: Summary
+        if: always()
+        run: |
+          . refs.env
+          . "$RUNNER_TEMP/env-report.env" 2>/dev/null || true
+          {
+            echo "### check-x1-negative (stock lld ${LLVM_BASE_RELEASE})"
+            echo
+            echo "| Run | Job | ImageVersion | Xcode | arm64e.x1 in libSystem.tbd | lld |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            echo "| ${{ github.run_id }} | check-x1-negative | ${IMAGE_VERSION:-} | ${XCODE_VERSION:-} | ${X1_IN_LIBSYSTEM_TBD:-} | stock ${LLVM_BASE_RELEASE} |"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/check/results.env" 2>/dev/null || true
+            grep -m 3 -E 'unknown architecture|could not load TAPI' "$RUNNER_TEMP/check/cxx-link.log" 2>/dev/null | cut -c1-300 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-check-x1-negative
+          path: |
+            ${{ runner.temp }}/check/*.log
+            ${{ runner.temp }}/check/results.env
+            ${{ runner.temp }}/env-report.env
+          if-no-files-found: warn
+
+  check-macos15:
+    needs: compose
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Runner image and SDK report
+        run: scripts/env-report.sh "$RUNNER_TEMP/env-report.env"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain
+          path: dl
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: stock-lld
+          path: stock-dl
+
+      - name: Unpack both variants
+        run: |
+          set -euo pipefail
+          (cd dl && shasum -a 256 -c ./*.sha256)
+          mkdir -p "$RUNNER_TEMP/tc-fixed" "$RUNNER_TEMP/tc-stock" "$RUNNER_TEMP/stock"
+          tar -xf dl/*.tar.xz -C "$RUNNER_TEMP/tc-fixed"
+          tar -xf dl/*.tar.xz -C "$RUNNER_TEMP/tc-stock"
+          tar -xf stock-dl/stock-lld.tar -C "$RUNNER_TEMP/stock"
+          stockdir=$(echo "$RUNNER_TEMP"/tc-stock/*)
+          rm -f "$stockdir/bin/lld" "$stockdir/bin/ld64.lld"
+          cp -p "$RUNNER_TEMP/stock/bin/lld" "$stockdir/bin/lld"
+          ln -s lld "$stockdir/bin/ld64.lld"
+          echo "TC_FIXED=$(echo "$RUNNER_TEMP"/tc-fixed/*)" >> "$GITHUB_ENV"
+          echo "TC_STOCK=$stockdir" >> "$GITHUB_ENV"
+
+      - name: Compile, link and run with the lld under test
+        run: scripts/check-link.sh "$TC_FIXED" "$RUNNER_TEMP/check-fixed"
+
+      - name: Compile, link and run with the stock lld
+        run: scripts/check-link.sh "$TC_STOCK" "$RUNNER_TEMP/check-stock"
+
+      - name: Assert
+        run: |
+          set -eu
+          ok=1
+          for variant in fixed stock; do
+            . "$RUNNER_TEMP/check-$variant/results.env"
+            echo "$variant: CXX_LINK=$CXX_LINK CXX_RUN=$CXX_RUN C_LINK=$C_LINK C_RUN=$C_RUN IMPORT_STD=$IMPORT_STD SYNTH_LINK=$SYNTH_LINK"
+            for v in CXX_LINK CXX_RUN C_LINK C_RUN; do
+              [ "${!v}" = pass ] || { echo "::error::$variant: $v is ${!v}, expected pass"; ok=0; }
+            done
+            case "$IMPORT_STD" in pass|not-applicable) ;; *) echo "::error::$variant: IMPORT_STD is $IMPORT_STD"; ok=0 ;; esac
+            if [ "$variant" = fixed ]; then
+              [ "$SYNTH_LINK" = pass ] || { echo "::error::fixed: SYNTH_LINK is $SYNTH_LINK, expected pass"; ok=0; }
+            else
+              [ "$SYNTH_LINK" = fail ] || { echo "::error::stock: SYNTH_LINK is $SYNTH_LINK, expected fail"; ok=0; }
+            fi
+          done
+          [ "$ok" = 1 ]
+
+      - name: Summary
+        if: always()
+        run: |
+          . refs.env
+          . "$RUNNER_TEMP/env-report.env" 2>/dev/null || true
+          {
+            echo "### check-macos15 (control)"
+            echo
+            echo "| Run | Job | ImageVersion | Xcode | arm64e.x1 in libSystem.tbd | lld commit |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            echo "| ${{ github.run_id }} | check-macos15 | ${IMAGE_VERSION:-} | ${XCODE_VERSION:-} | ${X1_IN_LIBSYSTEM_TBD:-} | ${LLVM_RELEASE_REF:0:12} and stock ${LLVM_BASE_RELEASE} |"
+            echo
+            echo '```'
+            for v in fixed stock; do echo "[$v]"; cat "$RUNNER_TEMP/check-$v/results.env" 2>/dev/null || true; done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-check-macos15
+          path: |
+            ${{ runner.temp }}/check-fixed/*.log
+            ${{ runner.temp }}/check-fixed/results.env
+            ${{ runner.temp }}/check-stock/*.log
+            ${{ runner.temp }}/check-stock/results.env
+            ${{ runner.temp }}/env-report.env
+          if-no-files-found: warn
+
+  publish:
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.compose.result == 'success'
+    needs: [compose, check-x1, check-x1-negative, check-macos15]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain
+          path: dist
+
+      - name: Publish the release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_X1: ${{ needs.check-x1.result }}
+          RESULT_NEGATIVE: ${{ needs.check-x1-negative.result }}
+          RESULT_MACOS15: ${{ needs.check-macos15.result }}
+        run: |
+          set -euo pipefail
+          . ./refs.env
+          short=${LLVM_RELEASE_REF:0:12}
+          tag="toolchain-${short}"
+          (cd dist && sha256sum -c ./*.sha256)
+          {
+            echo "Trimmed LLVM ${LLVM_BASE_RELEASE} toolchain for macOS arm64 whose ld64.lld is built from llvm-project \`${LLVM_RELEASE_REF}\` (${LLVM_RELEASE_BRANCH})."
+            echo
+            echo "Validation result of the workflow run that published it: check-x1 ${RESULT_X1}, check-x1-negative ${RESULT_NEGATIVE}, check-macos15 ${RESULT_MACOS15}."
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "sha256:"
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+            echo
+            echo "The MANIFEST.txt asset states which component comes from where."
+          } > release-notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "Toolchain ${LLVM_BASE_RELEASE} with lld ${short}" --notes-file release-notes.md
+          fi
+          gh release view "$tag" --json tagName,assets --jq '.tagName, (.assets[] | .name + " " + (.size|tostring) + " " + .url)'
