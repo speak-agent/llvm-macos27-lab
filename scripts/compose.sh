@@ -97,7 +97,7 @@ place_tool() {
   base=$(basename "$real")
   if [ ! -e "$tree/bin/$base" ]; then
     cp -p "$real" "$tree/bin/$base"
-    echo "bin/$base  official $name package" >> "$origins"
+    echo "bin/$base  official LLVM-${base_ver} package" >> "$origins"
   fi
   if [ "$n" != "$base" ] && [ ! -L "$tree/bin/$n" ] && [ ! -e "$tree/bin/$n" ]; then
     ln -s "$base" "$tree/bin/$n"
@@ -141,7 +141,7 @@ tar -C "$stock" -cf "$out/stock/stock-lld.tar" bin/lld bin/ld64.lld
 # The lld under test.
 if [ "$lld_dir" = "-" ]; then
   fixed=$stock
-  lld_origin="official $base_ver package (SUBSTITUTION: the lld under test was not built)"
+  lld_origin="official LLVM-${base_ver} package (SUBSTITUTION: the lld under test was not built)"
 else
   fixed=$lld_dir
   lld_origin="built from llvm-project $lld_commit"
@@ -162,26 +162,26 @@ fi
 # Resource directory and libc++ material, moved as they are in the package.
 if [ -d "$src/lib/clang" ]; then
   mv "$src/lib/clang" "$tree/lib/clang"
-  echo "lib/clang  official $name package (clang resource directory)" >> "$origins"
+  echo "lib/clang  official LLVM-${base_ver} package (clang resource directory)" >> "$origins"
 fi
 if [ -d "$src/include/c++" ]; then
   mkdir -p "$tree/include"
   mv "$src/include/c++" "$tree/include/c++"
-  echo "include/c++  official package (libc++ headers)" >> "$origins"
+  echo "include/c++  official LLVM-${base_ver} package (libc++ headers)" >> "$origins"
 fi
 for f in "$src"/lib/libc++* "$src"/lib/libunwind*; do
   if [ -e "$f" ] || [ -L "$f" ]; then
     mv "$f" "$tree/lib/"
-    echo "lib/$(basename "$f")  official package (libc++ family)" >> "$origins"
+    echo "lib/$(basename "$f")  official LLVM-${base_ver} package (libc++ family)" >> "$origins"
   fi
 done
 if [ -d "$src/share/libc++" ]; then
   mkdir -p "$tree/share"
   mv "$src/share/libc++" "$tree/share/libc++"
-  echo "share/libc++  official package (libc++ module sources)" >> "$origins"
+  echo "share/libc++  official LLVM-${base_ver} package (libc++ module sources)" >> "$origins"
 fi
 for f in "$src"/LICENSE "$src"/LICENSE.TXT "$src"/NOTICE; do
-  [ -e "$f" ] && cp -p "$f" "$tree/" && echo "$(basename "$f")  official package" >> "$origins"
+  [ -e "$f" ] && cp -p "$f" "$tree/" && echo "$(basename "$f")  official LLVM-${base_ver} package" >> "$origins"
 done
 true
 

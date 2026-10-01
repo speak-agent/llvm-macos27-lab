@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compiles, links and runs test programs with a toolchain directory against the
 # SDK of the running machine, with lld as the linker.
-#   check-link.sh <toolchain-dir> <work-dir>
+#   [LAB_SDK=<sdk-path>] check-link.sh <toolchain-dir> <work-dir>
 # Each step leaves <step>.log in the work directory and a line in results.env.
 # The script reports and does not abort on a failing step; the calling job
 # asserts the outcome it expects.
@@ -10,7 +10,7 @@ tc=$(cd "$1" && pwd)
 mkdir -p "$2"
 work=$(cd "$2" && pwd)
 cd "$work" || exit 2
-sdk=$(xcrun --show-sdk-path)
+sdk=${LAB_SDK:-$(xcrun --show-sdk-path)}   # LAB_SDK selects another SDK
 cxx=$tc/bin/clang++
 cc=$tc/bin/clang
 : > results.env

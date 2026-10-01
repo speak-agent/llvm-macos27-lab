@@ -23,6 +23,11 @@ launcher=()
 if command -v ccache >/dev/null 2>&1; then
   ccache --max-size=2G >/dev/null
   ccache --zero-stats >/dev/null
+  export CCACHE_LOGFILE="$out/ccache.log"
+  # LLVM 23 builds with precompiled headers by default (and passes -Xclang -fno-pch-timestamp
+  # for ccache); ccache needs this sloppiness to cache such compilations.
+  export CCACHE_SLOPPINESS=pch_defines,time_macros
+  ccache --version | head -n 1
   launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
 fi
 
@@ -83,4 +88,9 @@ tar -C "$build" -cf "$out/lld-macos-arm64.tar" "${members[@]}"
   echo "LLD_VERSION=$("$build/bin/ld64.lld" --version | head -n 1)"
   echo "LLD_BYTES=$(stat -f %z "$build/bin/lld")"
 } | tee "$out/build-info.env"
-if command -v ccache >/dev/null 2>&1; then ccache --show-stats; fi
+if command -v ccache >/dev/null 2>&1; then
+  ccache --show-stats --verbose
+  echo "== ccache result classes (from its log)"
+  grep -o 'Result: [a-z_]*' "$out/ccache.log" | sort | uniq -c | sort -rn | head -n 10 || true
+  rm -f "$out/ccache.log"
+fi

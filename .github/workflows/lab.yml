@@ -317,19 +317,32 @@ jobs:
         run: |
           set -eu
           . "$RUNNER_TEMP/check/results.env"
+          log="$RUNNER_TEMP/check/cxx-link.log"
           echo "CXX_LINK=$CXX_LINK C_LINK=$C_LINK SYNTH_LINK=$SYNTH_LINK"
           if [ "$CXX_LINK" = pass ]; then
             echo "::error::the stock lld linked the C++ program: the image no longer exercises the defect, so the positive result is not discriminating"
             exit 1
           fi
-          grep -q 'unknown architecture' "$RUNNER_TEMP/check/cxx-link.log" \
-            || { echo "::error::the failure does not contain 'unknown architecture'"; exit 1; }
-          grep -q 'arm64e.x1' "$RUNNER_TEMP/check/cxx-link.log" \
+          # LLVM 22 words the rejection "unknown architecture"; 23.1.2 words it "unknown target".
+          # Both name arm64e.x1 and both come from the TAPI (.tbd) loader.
+          grep -q 'could not load TAPI file' "$log" \
+            || { echo "::error::the failure is not a TAPI load failure"; exit 1; }
+          grep -q -E 'unknown (architecture|target)' "$log" \
+            || { echo "::error::the failure does not contain 'unknown architecture' or 'unknown target'"; exit 1; }
+          grep -q 'arm64e.x1' "$log" \
             || { echo "::error::the failure does not contain 'arm64e.x1'"; exit 1; }
           [ "$SYNTH_LINK" = fail ] \
             || { echo "::error::the stock lld linked the synthetic arm64e.x1 stub"; exit 1; }
           echo "the stock lld fails as expected:"
-          grep -m 3 -E 'unknown architecture|could not load TAPI' "$RUNNER_TEMP/check/cxx-link.log" | cut -c1-300
+          grep -m 4 -E 'unknown (architecture|target)|could not load TAPI' "$log" | cut -c1-300
+
+      - name: Control, the stock lld against an installed SDK that lacks arm64e.x1 (informational)
+        continue-on-error: true
+        run: |
+          sdk=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+          if [ ! -d "$sdk" ]; then echo "no pre-27 SDK at $sdk"; exit 0; fi
+          echo "arm64e.x1 occurrences in its libSystem.tbd: $(grep -c 'arm64e\.x1' "$sdk/usr/lib/libSystem.tbd" || true)"
+          LAB_SDK="$sdk" scripts/check-link.sh "$TC" "$RUNNER_TEMP/check-sdk26"
 
       - name: Summary
         if: always()
@@ -345,7 +358,9 @@ jobs:
             echo
             echo '```'
             cat "$RUNNER_TEMP/check/results.env" 2>/dev/null || true
-            grep -m 3 -E 'unknown architecture|could not load TAPI' "$RUNNER_TEMP/check/cxx-link.log" 2>/dev/null | cut -c1-300 || true
+            grep -m 4 -E 'unknown (architecture|target)|could not load TAPI' "$RUNNER_TEMP/check/cxx-link.log" 2>/dev/null | cut -c1-300 || true
+            echo "[stock lld against the SDK without arm64e.x1, informational]"
+            cat "$RUNNER_TEMP/check-sdk26/results.env" 2>/dev/null || echo "not run"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -356,6 +371,8 @@ jobs:
           path: |
             ${{ runner.temp }}/check/*.log
             ${{ runner.temp }}/check/results.env
+            ${{ runner.temp }}/check-sdk26/*.log
+            ${{ runner.temp }}/check-sdk26/results.env
             ${{ runner.temp }}/env-report.env
           if-no-files-found: warn
 
